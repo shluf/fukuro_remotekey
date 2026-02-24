@@ -1,0 +1,1 @@
+ros2 run fukuro_remotekey remotekey --ros-args --remap cmd_vel:=/robot1/cmd_vel

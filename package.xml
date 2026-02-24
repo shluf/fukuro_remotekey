@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>fukuro_remotekey</name>
+  <version>0.0.1</version>
+  <description>
+    Keyboard teleoperation for the Fukuro omniwheel robot.
+    Publishes cmd_vel (geometry_msgs/Twist) and calls dribbler,
+    kick, and SetReady services from fukuro_interface.
+  </description>
+
+  <maintainer email="luthfisalis09@gmail.com">shluf</maintainer>
+  <license>MIT</license>
+
+  <!-- ROS 2 runtime dependencies -->
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>fukuro_interface</depend>
+
+  <!-- Test dependencies -->
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
