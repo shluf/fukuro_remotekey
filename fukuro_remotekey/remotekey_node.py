@@ -19,6 +19,10 @@ Controls:
      f   : kick
      r   : toggle robot READY / STOP
 
+  PWM control:
+     t/g : increase/decrease dribbler PWM by 10
+     y/h : increase/decrease kick power by 10
+
   Speed:
      q/z : increase/decrease max speeds by 10%
      w/x : increase/decrease linear speed by 10%
@@ -28,16 +32,18 @@ Controls:
   CTRL-C / ESC: quit
 """
 
+import re
 import sys
 import select
 import termios
 import tty
+import shutil
 import threading
 
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-from fukuro_interface.srv import DribblerControl, KickService, SetReady, StopRobot
+from fukuro_interface.srv import DribblerControl, KickService, StopRobot
 
 # ─────────────────────────────────────────────
 # Key binding tables
@@ -79,6 +85,14 @@ SPEED_BINDINGS = {
     'c': (1.0, 0.9),
 }
 
+# PWM step size for dribbler and kick power
+PWM_STEP      = 10
+PWM_MIN       = 0
+PWM_MAX       = 255
+
+# Strip ANSI escape codes to measure plain-text length
+_ANSI_RE = re.compile(r'\033(?:\[[0-9;]*[mKJHABCDfnsu]|[78])')
+
 # ─────────────────────────────────────────────
 # Help banner
 # ─────────────────────────────────────────────
@@ -101,6 +115,10 @@ BANNER = """
    \033[1;32md\033[0m   : toggle Dribbler ON/OFF
    \033[1;32mf\033[0m   : Kick!
    \033[1;32mr\033[0m   : toggle robot Ready / Stop
+
+\033[1mPWM control:\033[0m
+   \033[1;35mt\033[0m / \033[1;35mg\033[0m : increase / decrease dribbler PWM by 10  (0–255)
+   \033[1;35my\033[0m / \033[1;35mh\033[0m : increase / decrease kick power by 10     (0–255)
 
 \033[1mSpeed control:\033[0m
    \033[1;34mq\033[0m / \033[1;34mz\033[0m : increase / decrease max speeds by 10%%
@@ -141,31 +159,34 @@ class FukuroRemoteKey(Node):
         self.vx              = 0.0
         self.vy              = 0.0
         self.omega           = 0.0
-        self.dribbler_active = False
-        self.robot_ready     = True   # True = ready, False = stopped
-        self.running         = True
+        self.dribbler_active    = False
+        self.robot_ready        = True   # True = ready, False = stopped
+        self.running            = True
+        self._print_lock        = threading.RLock()  # mencegah log duplikat antar thread
+        self._last_status_lines = 0
 
         # ── Publisher ─────────────────────────────────
-        # Default topic is 'cmd_vel'; remap in launch / CLI as needed.
-        self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+        # Publish langsung ke topic OmnidirectionalController (use_stamped_vel: false)
+        self.cmd_vel_pub = self.create_publisher(Twist, '/omnidirectional_controller/cmd_vel_unstamped', 10)
 
         # ── Service clients ───────────────────────────
         self.dribbler_client = self.create_client(
             DribblerControl, '/fukuro/controller/dribbler_control')
         self.kick_client = self.create_client(
             KickService, '/fukuro/controller/kick_service')
-        self.ready_client = self.create_client(
+        self.stop_client = self.create_client(
             StopRobot, '/fukuro/controller/stop_service')
 
         # ── Timer: publish velocity at 10 Hz ──────────
         self.timer = self.create_timer(0.1, self._publish_cmd_vel)
 
-        # ── Keyboard thread ───────────────────────────
-        self._key_thread = threading.Thread(target=self._keyboard_loop, daemon=True)
-        self._key_thread.start()
-
+        # ── Print banner ────────────
         print(BANNER)
         self._print_status()
+
+        # ── Keyboard thread ────────────
+        self._key_thread = threading.Thread(target=self._keyboard_loop, daemon=True)
+        self._key_thread.start()
 
     # ─── Velocity publisher ───────────────────────────────────────────────────
 
@@ -192,8 +213,10 @@ class FukuroRemoteKey(Node):
         try:
             result = future.result()
             state  = '\033[1;32mON\033[0m' if self.dribbler_active else '\033[1;31mOFF\033[0m'
-            print(f'\n  Dribbler → {state}  (success={result.success})')
-            self._print_status()
+            with self._print_lock:
+                self._erase_status()
+                print(f'  Dribbler → {state}  (success={result.success})')
+                self._print_status()
         except Exception as exc:
             self.get_logger().error(f'Dribbler service error: {exc}')
 
@@ -211,29 +234,32 @@ class FukuroRemoteKey(Node):
     def _kick_cb(self, future):
         try:
             result = future.result()
-            print(f'\n  \033[1;33mKICK!\033[0m  power={self.kick_power}  done={result.kick_done}')
-            self._print_status()
+            with self._print_lock:
+                self._erase_status()
+                print(f'  \033[1;33mKICK!\033[0m  power={self.kick_power}  done={result.kick_done}')
+                self._print_status()
         except Exception as exc:
             self.get_logger().error(f'Kick service error: {exc}')
 
-    def _call_set_ready(self, is_ready: bool):
-        if not self.ready_client.service_is_ready():
-            self.get_logger().warn('⚠  SetReady service not ready – skipping')
+    def _call_stop_robot(self, is_stopped: bool):
+        if not self.stop_client.service_is_ready():
+            self.get_logger().warn('⚠  StopRobot service not ready – skipping')
             return
-        req = SetReady.Request()
-        req.is_ready = is_ready
-        future = self.ready_client.call_async(req)
-        future.add_done_callback(self._set_ready_cb)
+        req = StopRobot.Request()
+        req.is_stop = is_stopped  # field sesuai StopRobot.srv
+        future = self.stop_client.call_async(req)
+        future.add_done_callback(self._stop_robot_cb)
 
-    def _set_ready_cb(self, future):
+    def _stop_robot_cb(self, future):
         try:
             result = future.result()
             state  = '\033[1;32mREADY\033[0m' if self.robot_ready else '\033[1;31mSTOPPED\033[0m'
-            print(f'\n  Robot → {state}  (success={result.success})')
-            self._print_status()
+            with self._print_lock:
+                self._erase_status()
+                print(f'  Robot → {state}  (success={result.success})')
+                self._print_status()
         except Exception as exc:
-            self.get_logger().error(f'SetReady service error: {exc}')
-
+            self.get_logger().error(f'StopRobot service error: {exc}')
     # ─── Keyboard loop ────────────────────────────────────────────────────────
 
     def _get_key(self, settings):
@@ -250,7 +276,10 @@ class FukuroRemoteKey(Node):
             while self.running and rclpy.ok():
                 key = self._get_key(settings)
                 if key:
-                    self._handle_key(key)
+                    try:
+                        self._handle_key(key)
+                    except Exception as exc:
+                        self.get_logger().error(f'Key handler error: {exc}')
         finally:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
 
@@ -276,7 +305,6 @@ class FukuroRemoteKey(Node):
             lin_f, ang_f = SPEED_BINDINGS[key]
             self.speed = round(self.speed * lin_f, 4)
             self.turn  = round(self.turn  * ang_f, 4)
-            print()
             self._print_status()
 
         # ── Dribbler toggle ────────────────────────────
@@ -284,24 +312,45 @@ class FukuroRemoteKey(Node):
             self.dribbler_active = not self.dribbler_active
             self._call_dribbler(self.dribbler_active)
 
+        # ── Dribbler PWM adjust ────────────────────────
+        elif key == 't':
+            self.dribbler_pwm = min(PWM_MAX, self.dribbler_pwm + PWM_STEP)
+            self._print_status()
+        elif key == 'g':
+            self.dribbler_pwm = max(PWM_MIN, self.dribbler_pwm - PWM_STEP)
+            self._print_status()
+
         # ── Kick ──────────────────────────────────────
         elif key == 'f':
             self._call_kick()
 
+        # ── Kick power adjust ─────────────────────────
+        elif key == 'y':
+            self.kick_power = min(PWM_MAX, self.kick_power + PWM_STEP)
+            self._print_status()
+        elif key == 'h':
+            self.kick_power = max(PWM_MIN, self.kick_power - PWM_STEP)
+            self._print_status()
+
         # ── Robot ready / stop toggle ──────────────────
         elif key == 'r':
             self.robot_ready = not self.robot_ready
-            self._call_set_ready(self.robot_ready)
+            # is_stop = True  saat robot_ready = False, dan sebaliknya
+            self._call_stop_robot(not self.robot_ready)
 
         # ── Emergency stop ─────────────────────────────
         elif key == ' ':
             self.vx = self.vy = self.omega = 0.0
-            print('\n  \033[1;31m⛔ EMERGENCY STOP\033[0m')
-            self._print_status()
+            with self._print_lock:
+                self._erase_status()
+                print('  \033[1;31m⛔ EMERGENCY STOP\033[0m')
+                self._print_status()
 
         # ── Quit ───────────────────────────────────────
         elif key in ('\x03', '\x1b'):  # CTRL-C or ESC
-            print('\n\033[1;90mBye!\033[0m')
+            with self._print_lock:
+                self._erase_status()
+                print('\033[1;90mBye!\033[0m')
             self.running = False
             self.vx = self.vy = self.omega = 0.0
             self._publish_cmd_vel()   # send zero before quitting
@@ -314,18 +363,32 @@ class FukuroRemoteKey(Node):
 
     # ─── Status line ──────────────────────────────────────────────────────────
 
+    def _erase_status(self):
+        if self._last_status_lines > 0:
+            up = '\033[A' * (self._last_status_lines - 1)
+            sys.stdout.write(up + '\r\033[J')
+            sys.stdout.flush()
+            self._last_status_lines = 0
+
     def _print_status(self):
         drib  = '\033[1;32mON\033[0m ' if self.dribbler_active else '\033[1;31mOFF\033[0m'
         ready = '\033[1;32mREADY  \033[0m' if self.robot_ready else '\033[1;31mSTOPPED\033[0m'
-        print(
-            f'\r\033[K'
-            f'  speed \033[1m{self.speed:.2f}\033[0m m/s  '
+        status = (
+            f'  spd \033[1m{self.speed:.2f}\033[0m m/s  '
             f'turn \033[1m{self.turn:.2f}\033[0m rad/s  │  '
-            f'dribbler: {drib}  │  '
+            f'drbl: {drib} pwm=\033[1;35m{self.dribbler_pwm}\033[0m  │  '
+            f'kick pwr=\033[1;35m{self.kick_power}\033[0m  │  '
             f'robot: {ready}  │  '
-            f'vel: ({self.vx:+.2f}, {self.vy:+.2f}, {self.omega:+.2f})',
-            end='', flush=True,
+            f'vel: ({self.vx:+.2f}, {self.vy:+.2f}, {self.omega:+.2f})'
         )
+        with self._print_lock:
+            term_cols = shutil.get_terminal_size().columns
+            plain_len = len(_ANSI_RE.sub('', status))
+            new_lines = max(1, (plain_len + term_cols - 1) // term_cols)
+            self._erase_status()
+            sys.stdout.write(status)
+            sys.stdout.flush()
+            self._last_status_lines = new_lines
 
 
 # ─────────────────────────────────────────────
