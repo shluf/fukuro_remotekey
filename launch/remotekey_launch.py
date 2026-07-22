@@ -47,11 +47,6 @@ def generate_launch_description():
         default_value='200',
         description='Power level for kick',
     )
-    servo_pos_arg = DeclareLaunchArgument(
-        'servo_pos',
-        default_value='0.0',
-        description='Servo position for kick',
-    )
 
     # ── Node ──────────────────────────────────────────────────────────────────
     remotekey_node = Node(
@@ -69,7 +64,6 @@ def generate_launch_description():
             'angular_speed': LaunchConfiguration('angular_speed'),
             'dribbler_pwm':  LaunchConfiguration('dribbler_pwm'),
             'kick_power':    LaunchConfiguration('kick_power'),
-            'servo_pos':     LaunchConfiguration('servo_pos'),
         }],
     )
 
@@ -79,6 +73,5 @@ def generate_launch_description():
         angular_speed_arg,
         dribbler_pwm_arg,
         kick_power_arg,
-        servo_pos_arg,
         remotekey_node,
     ])

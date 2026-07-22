@@ -14,10 +14,11 @@ Controls:
      J    K    L
      M    <    >
 
-  Robot actions:
-     d   : toggle dribbler ON/OFF
-     f   : kick
-     r   : toggle robot READY / STOP
+   Robot actions:
+      d   : toggle dribbler ON/OFF
+      f   : kick
+      v   : toggle kick mode (GROUND / CHIP)
+      r   : toggle robot READY / STOP
 
   PWM control:
      t/g : increase/decrease dribbler PWM by 10
@@ -114,6 +115,7 @@ BANNER = """
 \033[1mRobot actions:\033[0m
    \033[1;32md\033[0m   : toggle Dribbler ON/OFF
    \033[1;32mf\033[0m   : Kick!
+   \033[1;32mv\033[0m   : toggle kick mode (GROUND / CHIP)
    \033[1;32mr\033[0m   : toggle robot Ready / Stop
 
 \033[1mPWM control:\033[0m
@@ -147,19 +149,17 @@ class FukuroRemoteKey(Node):
         self.declare_parameter('angular_speed', 1.0)   # rad/s
         self.declare_parameter('dribbler_pwm', 200)    # PWM value for dribbler
         self.declare_parameter('kick_power', 200)        # kick power
-        self.declare_parameter('servo_pos', 0.0)        # servo position for kick
-
         self.speed = self.get_parameter('linear_speed').value
         self.turn  = self.get_parameter('angular_speed').value
         self.dribbler_pwm = self.get_parameter('dribbler_pwm').value
         self.kick_power   = self.get_parameter('kick_power').value
-        self.servo_pos    = self.get_parameter('servo_pos').value
 
         # ── State ─────────────────────────────────────
         self.vx              = 0.0
         self.vy              = 0.0
         self.omega           = 0.0
         self.dribbler_active    = False
+        self.exec_mode          = KickService.Request.GROUND  # GROUND=0 or CHIP=1
         self.robot_ready        = True   # True = ready, False = stopped
         self.running            = True
         self._print_lock        = threading.RLock()  # mencegah log duplikat antar thread
@@ -225,7 +225,7 @@ class FukuroRemoteKey(Node):
             self.get_logger().warn('⚠  Kick service not ready – skipping')
             return
         req = KickService.Request()
-        req.servo_pos  = float(self.servo_pos)
+        req.exec_mode  = self.exec_mode
         req.kick_power = int(self.kick_power)
         req.is_kick    = True
         future = self.kick_client.call_async(req)
@@ -236,7 +236,8 @@ class FukuroRemoteKey(Node):
             result = future.result()
             with self._print_lock:
                 self._erase_status()
-                print(f'  \033[1;33mKICK!\033[0m  power={self.kick_power}  done={result.kick_done}')
+                mode_label = 'GROUND' if self.exec_mode == KickService.Request.GROUND else 'CHIP'
+                print(f'  \033[1;33mKICK!\033[0m  mode={mode_label}  power={self.kick_power}  done={result.kick_done}')
                 self._print_status()
         except Exception as exc:
             self.get_logger().error(f'Kick service error: {exc}')
@@ -332,6 +333,14 @@ class FukuroRemoteKey(Node):
             self.kick_power = max(PWM_MIN, self.kick_power - PWM_STEP)
             self._print_status()
 
+        # ── Kick mode toggle (GROUND / CHIP) ──────────
+        elif key == 'v':
+            self.exec_mode = (
+                KickService.Request.CHIP if self.exec_mode == KickService.Request.GROUND
+                else KickService.Request.GROUND
+            )
+            self._print_status()
+
         # ── Robot ready / stop toggle ──────────────────
         elif key == 'r':
             self.robot_ready = not self.robot_ready
@@ -372,12 +381,13 @@ class FukuroRemoteKey(Node):
 
     def _print_status(self):
         drib  = '\033[1;32mON\033[0m ' if self.dribbler_active else '\033[1;31mOFF\033[0m'
+        mode  = '\033[1;33mGROUND\033[0m' if self.exec_mode == KickService.Request.GROUND else '\033[1;33mCHIP\033[0m'
         ready = '\033[1;32mREADY  \033[0m' if self.robot_ready else '\033[1;31mSTOPPED\033[0m'
         status = (
             f'  spd \033[1m{self.speed:.2f}\033[0m m/s  '
             f'turn \033[1m{self.turn:.2f}\033[0m rad/s  │  '
             f'drbl: {drib} pwm=\033[1;35m{self.dribbler_pwm}\033[0m  │  '
-            f'kick pwr=\033[1;35m{self.kick_power}\033[0m  │  '
+            f'kick pwr=\033[1;35m{self.kick_power}\033[0m {mode}  │  '
             f'robot: {ready}  │  '
             f'vel: ({self.vx:+.2f}, {self.vy:+.2f}, {self.omega:+.2f})'
         )
